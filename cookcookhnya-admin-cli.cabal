@@ -1,0 +1,41 @@
+cabal-version: 1.12
+
+-- This file has been generated from package.yaml by hpack version 0.37.0.
+--
+-- see: https://github.com/sol/hpack
+
+name:               cookcookhnya-admin-cli
+version:            0.1.0.0
+license:            MIT
+license-file:       LICENSE
+author:             danielambda
+maintainer:         daniel.gevorgyan25@gmail.com
+build-type:         Simple
+
+executable cookcookhnya-admin-cli
+    main-is: Main.hs
+    other-modules:
+          Paths_cookcookhnya_admin_cli
+    hs-source-dirs:
+          src
+    default-extensions:
+          ApplicativeDo
+          DataKinds
+          DuplicateRecordFields
+          LambdaCase
+          OverloadedRecordDot
+          RecordWildCards
+          TypeFamilies
+    ghc-options: -Wall
+    build-depends:
+          aeson
+        , base
+        , bytestring
+        , mtl
+        , servant-client
+        , text
+        , time
+        , uuid
+        , wai
+        , warp
+    default-language: GHC2021

@@ -1,0 +1,36 @@
+name: cookcookhnya-admin-cli
+version: 0.1.0.0
+license: MIT
+license-file: LICENSE
+author: danielambda
+maintainer: daniel.gevorgyan25@gmail.com
+build-type: Simple
+
+ghc-options: -Wall
+
+default-extensions:
+  - ApplicativeDo
+  - DataKinds
+  - DuplicateRecordFields
+  - LambdaCase
+  - OverloadedRecordDot
+  - RecordWildCards
+  - TypeFamilies
+
+language: GHC2021
+
+executables:
+  cookcookhnya-admin-cli:
+    main: Main.hs
+    source-dirs: src
+    dependencies:
+      - aeson
+      - base
+      - bytestring
+      - mtl
+      - servant-client
+      - text
+      - time
+      - uuid
+      - wai
+      - warp
