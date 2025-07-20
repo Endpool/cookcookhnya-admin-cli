@@ -17,8 +17,15 @@ import Data.Text (Text)
 import Data.UUID (UUID, fromLazyASCIIBytes)
 import Network.HTTP.Client (newManager, defaultManagerSettings)
 import qualified Data.Text as T
-import Servant.API ((:>), Get, JSON, QueryParam, Capture, ReqBody, PlainText, MimeUnrender (mimeUnrender), Post)
+import Servant.API ((:>), Get, JSON, QueryParam, ReqBody, PlainText, MimeUnrender (mimeUnrender), Post)
 import Servant.Client
+
+newtype IngredientName = IngredientName { value :: Text }
+
+data Ingredient = Ingredient
+  { id :: IngredientId
+  , name :: IngredientName
+  }
 
 instance MimeUnrender PlainText UUID where
   mimeUnrender _
@@ -56,14 +63,6 @@ searchIngredients
   -> Maybe Int -> Maybe Int
   -> ClientM (SearchResp IngredientResp)
 searchIngredients = client (Proxy @SearchIngredients)
-
-type GetIngredient
-  =  "public" :> "ingredients"
-  :> Capture "ingredient-id" IngredientId
-  :> Get '[JSON] IngredientResp
-
-getIngredient :: IngredientId -> ClientM IngredientResp
-getIngredient = client (Proxy @GetIngredient)
 
 data CreateRecipeReqBody = CreateRecipeReqBody
   { name :: Text
@@ -109,7 +108,7 @@ queryRecipesWithThreshold :: Text -> Int -> ClientM (SearchResp RecipeSearchResp
 queryRecipesWithThreshold query threshold =
   searchRecipes (Just query) (Just threshold) Nothing Nothing
 
-fetchIngredientWithName :: Text -> ClientM (Maybe (Int, IngredientId))
+fetchIngredientWithName :: Text -> ClientM (Maybe (Int, Ingredient))
 fetchIngredientWithName name = do
   liftIO $ putStrLn $ "Getting id for '" <> T.unpack name <> "'"
   getFirstJust $ map go [100, 99 .. 0]
@@ -118,7 +117,13 @@ fetchIngredientWithName name = do
       resp <- queryIngredientsWithThreshold name threshold
       pure $ case resp.results of
         []    -> Nothing
-        (x:_) -> Just (threshold, x.id)
+        (x:_) -> Just
+          ( threshold
+          , Ingredient
+            { id = x.id
+            , name = IngredientName x.name
+            }
+          )
 
 getFirstJust :: Monad m => [m (Maybe a)] -> m (Maybe a)
 getFirstJust [] = pure Nothing
@@ -144,18 +149,17 @@ createRecipe recipe = do
     getIngredientId ingredientName =
       fetchIngredientWithName ingredientName >>= \case
         Nothing -> pure $ Left $ "Ingredient '" <> T.unpack ingredientName <> "' not found"
-        Just (threshold, ingredientId) -> do
+        Just (threshold, ingredient) -> do
           if threshold >= trustedThreshold then
-            return $ Right ingredientId
+            return $ Right ingredient.id
           else do
-            ingredient <- getIngredient ingredientId
             liftIO $ do
               putStrLn $ "Matched with ingredient: '"
-                      <> T.unpack ingredient.name
+                      <> T.unpack ingredient.name.value
                       <> "', but I am not sure if it is the ingredient"
               putStrLn "Is it? y/n (default: n)"
               getLine >>= \case
-                ('y':_) -> return $ Right ingredientId
+                ('y':_) -> return $ Right ingredient.id
                 _ -> do
                   let err = "Skipping recipe '" <> T.unpack recipe.name <> "'"
                   putStrLn err
