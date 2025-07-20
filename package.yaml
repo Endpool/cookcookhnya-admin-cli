@@ -33,6 +33,7 @@ executables:
       - servant-client
       - text
       - time
+      - unix
       - uuid
       - wai
       - warp

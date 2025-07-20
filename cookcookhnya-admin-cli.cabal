@@ -37,6 +37,7 @@ executable cookcookhnya-admin-cli
         , servant-client
         , text
         , time
+        , unix
         , uuid
         , wai
         , warp
