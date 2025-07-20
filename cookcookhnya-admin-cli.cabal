@@ -31,7 +31,9 @@ executable cookcookhnya-admin-cli
           aeson
         , base
         , bytestring
+        , http-client
         , mtl
+        , servant
         , servant-client
         , text
         , time
