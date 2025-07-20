@@ -12,6 +12,15 @@
       perSystem = { self', config, pkgs, ... }:
         let
           cookcookhnya-admin-cli = self'.packages.cookcookhnya-admin-cli;
+
+          admin-cli-image = pkgs.dockerTools.buildLayeredImage {
+            name = "cookcookhnya-admin-cli";
+            tag = "latest";
+            contents = [cookcookhnya-admin-cli pkgs.cacert];
+            config = {
+              Entrypoint = ["${cookcookhnya-admin-cli}/bin/cookcookhnya-admin-cli"];
+            };
+          };
         in {
         haskellProjects.default = {
           autoWire = ["packages" "apps"];
@@ -21,15 +30,12 @@
         devShells.default = pkgs.mkShell {
           inputsFrom = [config.haskellProjects.default.outputs.devShell];
           packages = [pkgs.nixd pkgs.hpack];
-
-          shellHook = ''
-            set -a
-            source ./.env
-            set +a
-          '';
         };
 
-        packages.default = cookcookhnya-admin-cli;
+        packages = {
+          default = cookcookhnya-admin-cli;
+          inherit admin-cli-image;
+        };
       };
     };
 }
