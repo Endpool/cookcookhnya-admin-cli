@@ -8,26 +8,28 @@
 
 module Main where
 
-import Control.Monad (forM, forM_)
+import Control.Concurrent (Chan, newChan, readChan, writeChan, newEmptyMVar, forkFinally, putMVar, MVar, takeMVar)
+import Control.Monad (forM_, forever)
 import Control.Monad.IO.Class (MonadIO(liftIO))
 import Data.Aeson (FromJSON, decodeFileStrict)
+import Data.Functor ((<&>))
+import Data.IORef (IORef, newIORef, readIORef, modifyIORef')
+import Data.List (nub)
+import Data.Maybe (mapMaybe)
 import Data.Proxy (Proxy(..))
 import Data.Text (Text)
+import qualified Data.Text as T
+import qualified Data.Text.IO as T
 import Data.UUID (UUID, fromLazyASCIIBytes)
 import Data.UUID.V4 (nextRandom)
 import GHC.Generics (Generic)
 import Network.HTTP.Client (newManager, defaultManagerSettings)
-import qualified Data.Text as T
-import qualified Data.Text.IO as T
 import Servant.API ((:>), Get, JSON, QueryParam, PlainText, MimeUnrender (mimeUnrender))
 import Servant.Client
 import System.Environment (getArgs)
-import System.Posix.Signals
-import Data.IORef (IORef, newIORef, readIORef, modifyIORef')
 import System.Exit (ExitCode (..))
 import System.Posix (exitImmediately)
-import Data.Maybe (mapMaybe)
-import Data.List (nub)
+import System.Posix.Signals
 
 tshow :: Show a => a -> Text
 tshow = T.pack . show
@@ -36,19 +38,19 @@ quote :: Text -> Text
 quote = T.cons '\'' . flip T.snoc '\''
 
 newtype IngredientName = IngredientName { value :: Text }
-  deriving Eq
+  deriving (Eq, Show)
 
 data Ingredient = Ingredient
   { id :: IngredientId
   , name :: IngredientName
-  }
+  } deriving Show
 
 instance MimeUnrender PlainText UUID where
   mimeUnrender _
     = maybe (Left "Failed to parse UUID") Right
     . fromLazyASCIIBytes
 
-data InputRecipe = Recipe
+data InputRecipe = InputRecipe
   { name :: Text
   , url :: Text
   , ingredients :: [Text]
@@ -80,7 +82,7 @@ searchIngredients
   -> ClientM (SearchResp IngredientResp)
 searchIngredients = client (Proxy @SearchIngredients)
 
-data Recipe = CreateRecipeReqBody
+data Recipe = Recipe
   { name :: Text
   , sourceLink :: Text
   , ingredients :: [Ingredient]
@@ -118,8 +120,7 @@ queryRecipesWithThreshold query threshold =
 
 fetchIngredientWithName :: Text -> ClientM (Maybe (Int, Ingredient))
 fetchIngredientWithName name = do
-  liftIO $ putStrLn $ "Getting id for '" <> T.unpack name <> "'"
-  getFirstJust $ map go [100, 99 .. 0]
+  getFirstJust $ map go [trustedThreshold, 1]
   where
     go threshold = do
       resp <- queryIngredientsWithThreshold name threshold
@@ -142,36 +143,65 @@ getFirstJust (x:xs) = x >>= \case
 trustedThreshold :: Int
 trustedThreshold = 97
 
-processRecipe :: InputRecipe -> ClientM (Either String Recipe)
-processRecipe recipe = do
+data FetchIngredientResult
+  = FetchSuccess      Ingredient
+  | FetchNotSure Text Ingredient
+  | FetchFailure Text
+  deriving Show
+
+data FetchRecipeResult = FetchRecipeResult
+  { name        :: Text
+  , sourceLink  :: Text
+  , ingredients :: [FetchIngredientResult]
+  }
+
+fetchRecipe :: InputRecipe -> ClientM FetchRecipeResult
+fetchRecipe recipe = do
   let recipeIngredientNames = map T.toLower recipe.ingredients
-  ingredientsResults <- traverse getIngredient recipeIngredientNames
-  forM (sequenceA ingredientsResults) $ \ingredients ->
-    pure CreateRecipeReqBody
-      { name        = recipe.name
-      , sourceLink  = recipe.url
-      , ingredients = ingredients
-      }
+  ingredients <- traverse fetchIngredient recipeIngredientNames
+  pure FetchRecipeResult
+    { name        = recipe.name
+    , sourceLink  = recipe.url
+    , ingredients = ingredients
+    }
   where
-    getIngredient :: Text -> ClientM (Either String Ingredient)
-    getIngredient ingredientName =
-      fetchIngredientWithName ingredientName >>= \case
-        Nothing -> pure $ Left $ "Ingredient '" <> T.unpack ingredientName <> "' not found"
-        Just (threshold, ingredient) -> do
-          if threshold >= trustedThreshold then
-            return $ Right ingredient
-          else do
-            liftIO $ do
-              putStrLn $ "Matched with ingredient: '"
-                      <> T.unpack ingredient.name.value
-                      <> "', but I am not sure if it is the ingredient"
-              putStrLn "Is it? y/n (default: n)"
-              getLine >>= \case
-                ('y':_) -> return $ Right ingredient
-                _ -> do
-                  let err = "Skipping recipe '" <> T.unpack recipe.name <> "'"
-                  putStrLn err
-                  return $ Left err
+    fetchIngredient :: Text -> ClientM FetchIngredientResult
+    fetchIngredient ingredientName =
+      fetchIngredientWithName ingredientName <&> \case
+        Just (threshold, ingredient)
+          | threshold >= trustedThreshold -> FetchSuccess                ingredient
+          | otherwise                     -> FetchNotSure ingredientName ingredient
+        Nothing                           -> FetchFailure ingredientName
+
+collectRecipe :: FetchRecipeResult -> IO (Either String Recipe)
+collectRecipe fetchRecipeResult =
+  fmap toRecipe . sequenceA <$> traverse getIngredient fetchRecipeResult.ingredients
+  where
+    toRecipe ingredients = Recipe
+      { name       = fetchRecipeResult.name
+      , sourceLink = fetchRecipeResult.sourceLink
+      , ingredients= ingredients
+      }
+
+    getIngredient :: FetchIngredientResult -> IO (Either String Ingredient)
+    getIngredient = \case
+      FetchSuccess                ingredient ->
+        pure $ Right ingredient
+      FetchNotSure ingredientName ingredient -> do
+        T.putStrLn $ "'"
+                  <> ingredientName
+                  <> "' matched with ingredient: '"
+                  <> ingredient.name.value
+                  <> "', but I am not sure if it is the ingredient"
+        T.putStrLn "Is it? y/n (default: n)"
+        getLine >>= \case
+          ('y':_) -> return $ Right ingredient
+          _ -> do
+            let err = "Skipping recipe '" <> T.unpack fetchRecipeResult.name <> "'"
+            putStrLn err
+            return $ Left err
+      FetchFailure ingredientName ->
+        pure $ Left $ "Ingredient '" <> T.unpack ingredientName <> "' not found"
 
 data DbRecipe = DbRecipe
   { id :: RecipeId
@@ -236,7 +266,7 @@ dbIngredientToInsertValuesTuple DbIngredient{id, ownerId, name, isPublished}
   <> ")"
 
 publicRecipeToDb :: RecipeId -> Recipe -> (DbRecipe, [DbRecipeIngredient], [DbIngredient])
-publicRecipeToDb recipeId CreateRecipeReqBody{name, sourceLink, ingredients} =
+publicRecipeToDb recipeId Recipe{name, sourceLink, ingredients} =
   ( DbRecipe{id = recipeId, name, creatorId = Nothing, isPublished = True, sourceLink = Just sourceLink}
   , DbRecipeIngredient recipeId <$> map (.id) ingredients
   , map dbIngredientFromIngredient ingredients
@@ -255,6 +285,12 @@ traverseAndAccumulateInto ref f as =
   forM_ as $ \a -> do
     b <- f a
     liftIO $ modifyIORef' ref (b:)
+
+traverseAndPushInto :: MonadIO m => Chan b -> (a -> m b) -> [a] -> m ()
+traverseAndPushInto chan f as =
+  forM_ as $ \a -> do
+    b <- f a
+    liftIO $ writeChan chan b
 
 ingredientsToInsertStatement :: [Ingredient] -> Text
 ingredientsToInsertStatement = undefined
@@ -307,9 +343,16 @@ outputRecipes recipesRef = do
   putStrLn "Writing all of that to 'init_db.sql'"
   T.writeFile "init_db.sql" finalResult
 
+forkThread :: IO a -> IO (MVar ())
+forkThread proc = do
+  handle <- newEmptyMVar
+  forkFinally proc (\err -> either print (const $ pure ()) err >> putMVar handle ())
+  return handle
+
 main :: IO ()
 main = do
   recipesRef <- newIORef []
+  recipesChan <- newChan
 
   installHandler sigINT (Catch $ outputRecipes recipesRef >> exitImmediately ExitSuccess) Nothing
 
@@ -320,5 +363,17 @@ main = do
 
   manager <- newManager defaultManagerSettings
   let clientEnv = mkClientEnv manager (BaseUrl Http host port "")
-  traverseAndAccumulateInto recipesRef processRecipe parsedRecipes `runClientM` clientEnv
+
+  fetchingThread <- forkThread $
+    traverseAndPushInto recipesChan fetchRecipe parsedRecipes `runClientM` clientEnv >>= \case
+      Left err -> fail $ show err
+      Right () -> pure ()
+
+  collectingThread <- forkThread $ forever $ do
+    res <- readChan recipesChan >>= collectRecipe
+    modifyIORef' recipesRef (res:)
+
+  takeMVar fetchingThread
+  takeMVar collectingThread
+
   outputRecipes recipesRef
