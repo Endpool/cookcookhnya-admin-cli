@@ -2,14 +2,15 @@
 
 module BackendClient
   ( searchIngredients, queryIngredientsWithThreshold
+  , createPublicIngredient
   , SearchResp(..)
   , IngredientResp(..)
   ) where
 
 import Data.Text (Text)
-import Servant.API ((:>), Get, JSON, QueryParam)
+import Servant.API ((:>), Get, JSON, QueryParam, ReqBody, PostCreated, PlainText)
 import Servant.Client (ClientM, client)
-import Data.Aeson (FromJSON)
+import Data.Aeson (FromJSON, ToJSON)
 import GHC.Generics (Generic)
 
 import Ids
@@ -41,4 +42,15 @@ queryIngredientsWithThreshold :: Text -> Int -> ClientM (SearchResp IngredientRe
 queryIngredientsWithThreshold query threshold =
   searchIngredients (Just query) (Just threshold) Nothing Nothing
 
+newtype CreateIngredientReqBody = CreateIngredientReqBody
+  { name :: Text
+  } deriving Generic
+instance ToJSON CreateIngredientReqBody
 
+type CreatePublicIngredient
+  =  "admin" :> "ingredients"
+  :> ReqBody '[JSON] CreateIngredientReqBody
+  :> PostCreated '[PlainText] Text
+
+createPublicIngredient :: Text -> ClientM Text
+createPublicIngredient = client (Proxy @CreatePublicIngredient) . CreateIngredientReqBody

@@ -7,6 +7,7 @@
 module Main (main) where
 
 import Control.Concurrent (newChan, readChan, takeMVar)
+import Control.Concurrent.Async (mapConcurrently_)
 import Control.Monad (forever)
 import Data.Aeson (FromJSON, decodeFileStrict)
 import Data.Functor ((<&>))
@@ -16,19 +17,25 @@ import Data.Maybe (mapMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.IO as T
+import qualified Data.HashTable.IO as HT
 import Data.UUID.V4 (nextRandom)
 import GHC.Generics (Generic)
 import Network.HTTP.Client (newManager, defaultManagerSettings)
 import Servant.Client (ClientM, BaseUrl (BaseUrl), Scheme (Http), mkClientEnv, runClientM)
 import System.Environment (getArgs)
-import System.Exit (ExitCode (..))
+import System.Exit (ExitCode (..), exitFailure)
 import System.Posix (exitImmediately)
-import System.Posix.Signals
+import System.Posix.Signals (Handler(Catch), sigINT, installHandler)
 
 import BackendClient
 import Ids
 import SqlGeneration
 import Utils
+import Control.Monad.Except (ExceptT, MonadError (throwError), runExceptT)
+import Control.Monad.IO.Class (liftIO)
+import System.Timeout (timeout)
+
+type HashMap k v = HT.BasicHashTable k v
 
 newtype IngredientName = IngredientName { value :: Text }
   deriving (Eq, Show)
@@ -52,7 +59,7 @@ data Recipe = Recipe
   { name :: Text
   , sourceLink :: Text
   , ingredients :: [Ingredient]
-  }
+  } deriving (Show)
 
 trustedThreshold :: Int
 trustedThreshold = 97
@@ -82,8 +89,8 @@ data FetchRecipeResult = FetchRecipeResult
   , ingredients :: [FetchIngredientResult]
   }
 
-fetchRecipe :: InputRecipe -> ClientM FetchRecipeResult
-fetchRecipe recipe = do
+fetchRecipe :: HashMap Text (Maybe Ingredient) -> InputRecipe -> ClientM FetchRecipeResult
+fetchRecipe ingredientsMap recipe = do
   let recipeIngredientNames = map T.toLower recipe.ingredients
   ingredients <- traverse fetchIngredient recipeIngredientNames
   pure FetchRecipeResult
@@ -93,39 +100,52 @@ fetchRecipe recipe = do
     }
   where
     fetchIngredient :: Text -> ClientM FetchIngredientResult
-    fetchIngredient ingredientName =
-      fetchIngredientWithName ingredientName <&> \case
-        Just (threshold, ingredient)
-          | threshold >= trustedThreshold -> FetchSuccess                ingredient
-          | otherwise                     -> FetchNotSure ingredientName ingredient
-        Nothing                           -> FetchFailure ingredientName
+    fetchIngredient ingredientName = do
+      liftIO (HT.lookup ingredientsMap ingredientName) >>= \case
+        Just (Just ingredient) -> pure $ FetchSuccess ingredient
+        Just Nothing           -> pure $ FetchFailure ingredientName
+        Nothing ->
+          fetchIngredientWithName ingredientName <&> \case
+            Just (threshold, ingredient)
+              | threshold >= trustedThreshold -> FetchSuccess                ingredient
+              | otherwise                     -> FetchNotSure ingredientName ingredient
+            Nothing                           -> FetchFailure ingredientName
 
-collectRecipe :: FetchRecipeResult -> IO (Either String Recipe)
-collectRecipe fetchRecipeResult =
-  fmap toRecipe . sequenceA <$> traverse getIngredient fetchRecipeResult.ingredients
+collectRecipe :: HashMap Text (Maybe Ingredient) -> FetchRecipeResult -> IO (Either String Recipe)
+collectRecipe ingredientsMap fetchRecipeResult
+  = fmap (fmap toRecipe)
+  $ runExceptT
+  $ traverse getIngredient fetchRecipeResult.ingredients
   where
     toRecipe ingredients = Recipe
-      { name       = fetchRecipeResult.name
-      , sourceLink = fetchRecipeResult.sourceLink
-      , ingredients= ingredients
+      { name        = fetchRecipeResult.name
+      , sourceLink  = fetchRecipeResult.sourceLink
+      , ingredients = ingredients
       }
 
-    getIngredient :: FetchIngredientResult -> IO (Either String Ingredient)
+    getIngredient :: FetchIngredientResult -> (ExceptT String IO) Ingredient
     getIngredient = \case
-      FetchSuccess                ingredient ->
-        pure $ Right ingredient
+      FetchSuccess                ingredient -> pure ingredient
       FetchNotSure ingredientName ingredient -> do
-        T.putStrLn $ "'" <> ingredientName <> "' matched with ingredient: '"
-                  <> ingredient.name.value <> "', but I am not sure if it is the ingredient"
-        T.putStrLn "Is it? y/n (default: n)"
-        getLine >>= \case
-          ('y':_) -> return $ Right ingredient
-          _ -> do
-            let err = "Skipping recipe '" <> T.unpack fetchRecipeResult.name <> "'"
-            putStrLn err
-            return $ Left err
+        liftIO (HT.lookup ingredientsMap ingredientName) >>= \case
+          Just (Just lookedUpIngredient) -> pure lookedUpIngredient
+
+          Just Nothing -> throwError $ "Skipping recipe '" <> T.unpack fetchRecipeResult.name <> "'"
+          Nothing -> do
+            liftIO $ T.putStr $ T.unlines
+              [ quote ingredientName <> " from " <> quote fetchRecipeResult.name
+              , quote ingredient.name.value <> " from database"
+              , "But I am not sure if it is the ingredient. Is it? y/n (default: n)"
+              ]
+            liftIO getLine >>= \case
+              ('y':_) -> do
+                liftIO $ HT.insert ingredientsMap ingredientName (Just ingredient)
+                pure ingredient
+              _       -> do
+                liftIO $ HT.insert ingredientsMap ingredientName Nothing
+                throwError $ "Skipping recipe '" <> T.unpack fetchRecipeResult.name <> "'"
       FetchFailure ingredientName ->
-        pure $ Left $ "Ingredient '" <> T.unpack ingredientName <> "' not found"
+        throwError $ "Ingredient '" <> T.unpack ingredientName <> "' not found"
 
 publicRecipeToDb :: RecipeId -> Recipe -> (DbRecipe, [DbRecipeIngredient], [DbIngredient])
 publicRecipeToDb recipeId Recipe{name, sourceLink, ingredients} =
@@ -153,13 +173,13 @@ recipesWithIdsToInsertStatements recipesWithIds
 
     insertDbIngredients = dbIngredientInsertBegining
                       <> T.intercalate ",\n" insertDbIngredientsValueTuples
-                      <> ";"
+                      <> "\nON CONFLICT DO NOTHING;"
     insertDbRecipes = dbRecipeInsertBegining
                    <> T.intercalate ",\n" insertDbRecipesValueTuples
-                   <> ";"
+                   <> "\nON CONFLICT DO NOTHING;"
     insertDbRecipeIngredients = dbRecipeIngredientInsertBegining
                              <> T.intercalate ",\n" insertDbRecipeIngredientsValueTuples
-                             <> ";"
+                             <> "\nON CONFLICT DO NOTHING;"
 
 recipesToInsertStatements :: [Recipe] -> IO Text
 recipesToInsertStatements
@@ -174,13 +194,13 @@ outputRecipes recipesRef = do
   putStrLn "Writing all of that to 'init_db.sql'"
   T.writeFile "init_db.sql" finalResult
 
-parseArgs :: IO (String, Int, String)
+parseArgs :: IO (String, Int, String, String)
 parseArgs =
   getArgs >>= \case
-    (host : portStr : filename : _) -> do
+    [host, portStr, recipesFilename, ingredientsFilename] -> do
       port <- readIO portStr
-      pure (host, port, filename)
-    _ -> fail "Expected arguments: <host> <port> <filename>"
+      pure (host, port, recipesFilename, ingredientsFilename)
+    _ -> fail "Expected arguments: <host> <port> <recipes-filename> <ingredients-filename>"
 
 main :: IO ()
 main = do
@@ -189,21 +209,41 @@ main = do
 
   installHandler sigINT (Catch $ outputRecipes recipesRef >> exitImmediately ExitSuccess) Nothing
 
-  (host, port, filename) <- parseArgs
+  (host, port, recipesFilename, ingredientsFilename) <- parseArgs
 
-  parsedRecipes <- concat <$> decodeFileStrict filename
+  parsedRecipes <- decodeFileStrict recipesFilename >>= \case
+    Nothing -> do
+      putStrLn $ "Failed to parse '" <> recipesFilename <> "'"
+      exitFailure
+    Just a -> pure a
   putStrLn $ show (length parsedRecipes) <> " recipes found"
+
+  parsedIngredients :: [Text] <- decodeFileStrict ingredientsFilename >>= \case
+    Nothing -> do
+      putStrLn $ "Failed to parse '" <> ingredientsFilename <> "'"
+      exitFailure
+    Just a -> pure a
+  putStrLn $ show (length parsedIngredients) <> " ingredients found"
 
   manager <- newManager defaultManagerSettings
   let clientEnv = mkClientEnv manager (BaseUrl Http host port "")
 
+  let ioCreateIngredient name = createPublicIngredient name `runClientM` clientEnv >>= \case
+        Left err -> fail $ show err
+        Right _ -> pure ()
+  mapConcurrently_ ioCreateIngredient parsedIngredients
+
+  ingredientsMap <- HT.new
+
   fetchingThread <- forkThread $
-    traverseAndPushInto recipesChan fetchRecipe parsedRecipes `runClientM` clientEnv >>= \case
+    traverseAndPushInto recipesChan (fetchRecipe ingredientsMap) parsedRecipes `runClientM` clientEnv >>= \case
       Left err -> fail $ show err
       Right () -> pure ()
 
   collectingThread <- forkThread $ forever $ do
-    res <- readChan recipesChan >>= collectRecipe
+    res <- timeout 10_000_000 (readChan recipesChan) >>= \case -- 10 seconds
+      Nothing -> outputRecipes recipesRef >> exitImmediately ExitSuccess
+      Just recipe -> collectRecipe ingredientsMap recipe
     modifyIORef' recipesRef (res:)
 
   takeMVar fetchingThread
