@@ -15,6 +15,10 @@ build-type:         Simple
 executable cookcookhnya-admin-cli
     main-is: Main.hs
     other-modules:
+          BackendClient
+          Ids
+          SqlGeneration
+          Utils
           Paths_cookcookhnya_admin_cli
     hs-source-dirs:
           src
